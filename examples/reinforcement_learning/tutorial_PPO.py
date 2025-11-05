@@ -2,36 +2,18 @@
 Proximal Policy Optimization (PPO)
 ----------------------------
 A simple version of Proximal Policy Optimization (PPO) using single thread.
-PPO is a family of first-order methods that use a few other tricks to keep new policies close to old.
-PPO methods are significantly simpler to implement, and empirically seem to perform at least as well as TRPO.
-Reference
----------
-Proximal Policy Optimization Algorithms, Schulman et al. 2017
-High Dimensional Continuous Control Using Generalized Advantage Estimation, Schulman et al. 2016
-Emergence of Locomotion Behaviours in Rich Environments, Heess et al. 2017
-MorvanZhou's tutorial page: https://morvanzhou.github.io/tutorials
-Environment
------------
-Openai Gym Pendulum-v0, continual action space
-Prerequisites
---------------
-tensorflow >=2.0.0a0
-tensorflow-probability 0.6.0
-tensorlayer >=2.0.0
-To run
-------
-python tutorial_PPO.py --train/test
+Environment: OpenAI Gym Pendulum-v1
 """
+
 import argparse
 import os
 import time
 
-import gym
+import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
-
 import tensorlayer as tl
 
 parser = argparse.ArgumentParser(description='Train or test neural net motor controller.')
@@ -40,21 +22,20 @@ parser.add_argument('--test', dest='test', action='store_true', default=True)
 args = parser.parse_args()
 
 #####################  hyper parameters  ####################
-
-ENV_ID = 'Pendulum-v0'  # environment id
-RANDOM_SEED = 1  # random seed
-RENDER = False  # render while training
+ENV_ID = 'Pendulum-v1'
+RANDOM_SEED = 1
+RENDER = False
 
 ALG_NAME = 'PPO'
-TRAIN_EPISODES = 1000  # total number of episodes for training
-TEST_EPISODES = 10  # total number of episodes for testing
-MAX_STEPS = 200  # total number of steps for each episode
-GAMMA = 0.9  # reward discount
-LR_A = 0.0001  # learning rate for actor
-LR_C = 0.0002  # learning rate for critic
-BATCH_SIZE = 32  # update batch size
-ACTOR_UPDATE_STEPS = 10  # actor update steps
-CRITIC_UPDATE_STEPS = 10  # critic update steps
+TRAIN_EPISODES = 10
+TEST_EPISODES = 10
+MAX_STEPS = 10
+GAMMA = 0.9
+LR_A = 0.0001
+LR_C = 0.0002
+BATCH_SIZE = 32
+ACTOR_UPDATE_STEPS = 10
+CRITIC_UPDATE_STEPS = 10
 
 # ppo-penalty parameters
 KL_TARGET = 0.01
@@ -63,14 +44,9 @@ LAM = 0.5
 # ppo-clip parameters
 EPSILON = 0.2
 
-
 ###############################  PPO  ####################################
 
-
 class PPO(object):
-    """
-    PPO class
-    """
     def __init__(self, state_dim, action_dim, action_bound, method='clip'):
         # critic
         with tf.name_scope('critic'):
@@ -109,54 +85,34 @@ class PPO(object):
         self.action_bound = action_bound
 
     def train_actor(self, state, action, adv, old_pi):
-        """
-        Update policy network
-        :param state: state batch
-        :param action: action batch
-        :param adv: advantage batch
-        :param old_pi: old pi distribution
-        :return: kl_mean or None
-        """
         with tf.GradientTape() as tape:
             mean, std = self.actor(state), tf.exp(self.actor.logstd)
             pi = tfp.distributions.Normal(mean, std)
-
             ratio = tf.exp(pi.log_prob(action) - old_pi.log_prob(action))
             surr = ratio * adv
-            if self.method == 'penalty':  # ppo penalty
+            if self.method == 'penalty':
                 kl = tfp.distributions.kl_divergence(old_pi, pi)
                 kl_mean = tf.reduce_mean(kl)
                 loss = -(tf.reduce_mean(surr - self.lam * kl))
-            else:  # ppo clip
+            else:
                 loss = -tf.reduce_mean(
                     tf.minimum(surr,
                                tf.clip_by_value(ratio, 1. - self.epsilon, 1. + self.epsilon) * adv)
                 )
-        a_gard = tape.gradient(loss, self.actor.trainable_weights)
-        self.actor_opt.apply_gradients(zip(a_gard, self.actor.trainable_weights))
-
+        grads = tape.gradient(loss, self.actor.trainable_weights)
+        self.actor_opt.apply_gradients(zip(grads, self.actor.trainable_weights))
         if self.method == 'kl_pen':
             return kl_mean
 
     def train_critic(self, reward, state):
-        """
-        Update actor network
-        :param reward: cumulative reward batch
-        :param state: state batch
-        :return: None
-        """
         reward = np.array(reward, dtype=np.float32)
         with tf.GradientTape() as tape:
             advantage = reward - self.critic(state)
             loss = tf.reduce_mean(tf.square(advantage))
-        grad = tape.gradient(loss, self.critic.trainable_weights)
-        self.critic_opt.apply_gradients(zip(grad, self.critic.trainable_weights))
+        grads = tape.gradient(loss, self.critic.trainable_weights)
+        self.critic_opt.apply_gradients(zip(grads, self.critic.trainable_weights))
 
     def update(self):
-        """
-        Update parameter with the constraint of KL divergent
-        :return: None
-        """
         s = np.array(self.state_buffer, np.float32)
         a = np.array(self.action_buffer, np.float32)
         r = np.array(self.cumulative_reward_buffer, np.float32)
@@ -164,7 +120,6 @@ class PPO(object):
         pi = tfp.distributions.Normal(mean, std)
         adv = r - self.critic(s)
 
-        # update actor
         if self.method == 'kl_pen':
             for _ in range(ACTOR_UPDATE_STEPS):
                 kl = self.train_actor(s, a, adv, pi)
@@ -176,7 +131,6 @@ class PPO(object):
             for _ in range(ACTOR_UPDATE_STEPS):
                 self.train_actor(s, a, adv, pi)
 
-        # update critic
         for _ in range(CRITIC_UPDATE_STEPS):
             self.train_critic(r, s)
 
@@ -186,59 +140,34 @@ class PPO(object):
         self.reward_buffer.clear()
 
     def get_action(self, state, greedy=False):
-        """
-        Choose action
-        :param state: state
-        :param greedy: choose action greedy or not
-        :return: clipped action
-        """
         state = state[np.newaxis, :].astype(np.float32)
         mean, std = self.actor(state), tf.exp(self.actor.logstd)
         if greedy:
             action = mean[0]
         else:
             pi = tfp.distributions.Normal(mean, std)
-            action = tf.squeeze(pi.sample(1), axis=0)[0]  # choosing action
+            action = tf.squeeze(pi.sample(1), axis=0)[0]
         return np.clip(action, -self.action_bound, self.action_bound)
 
     def save(self):
-        """
-        save trained weights
-        :return: None
-        """
         path = os.path.join('model', '_'.join([ALG_NAME, ENV_ID]))
-        if not os.path.exists(path):
-            os.makedirs(path)
-        tl.files.save_weights_to_hdf5(os.path.join(path, 'actor.hdf5'), self.actor)
-        tl.files.save_weights_to_hdf5(os.path.join(path, 'critic.hdf5'), self.critic)
+        os.makedirs(path, exist_ok=True)
+        tl.files.save_npz_dict(self.actor.trainable_weights, name=os.path.join(path, 'actor_weights.npz'))
+        tl.files.save_npz_dict(self.critic.trainable_weights, name=os.path.join(path, 'critic_weights.npz'))
 
     def load(self):
-        """
-        load trained weights
-        :return: None
-        """
         path = os.path.join('model', '_'.join([ALG_NAME, ENV_ID]))
-        tl.files.load_hdf5_to_weights_in_order(os.path.join(path, 'actor.hdf5'), self.actor)
-        tl.files.load_hdf5_to_weights_in_order(os.path.join(path, 'critic.hdf5'), self.critic)
+        tl.files.load_and_assign_npz_dict(name=os.path.join(path, 'actor_weights.npz'), network=self.actor)
+        tl.files.load_and_assign_npz_dict(name=os.path.join(path, 'critic_weights.npz'), network=self.critic)
+
+
 
     def store_transition(self, state, action, reward):
-        """
-        Store state, action, reward at each step
-        :param state:
-        :param action:
-        :param reward:
-        :return: None
-        """
         self.state_buffer.append(state)
         self.action_buffer.append(action)
         self.reward_buffer.append(reward)
 
     def finish_path(self, next_state, done):
-        """
-        Calculate cumulative reward
-        :param next_state:
-        :return: None
-        """
         if done:
             v_s_ = 0
         else:
@@ -254,12 +183,14 @@ class PPO(object):
 
 
 if __name__ == '__main__':
-    env = gym.make(ENV_ID).unwrapped
+    env = gym.make(ENV_ID)
 
-    # reproducible
-    env.seed(RANDOM_SEED)
+    # seed environment and spaces
+    state, info = env.reset(seed=RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
     tf.random.set_seed(RANDOM_SEED)
+    env.action_space.seed(RANDOM_SEED)
+    env.observation_space.seed(RANDOM_SEED)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -271,18 +202,18 @@ if __name__ == '__main__':
     if args.train:
         all_episode_reward = []
         for episode in range(TRAIN_EPISODES):
-            state = env.reset()
+            state, info = env.reset()
             episode_reward = 0
-            for step in range(MAX_STEPS):  # in one episode
+            for step in range(MAX_STEPS):
                 if RENDER:
                     env.render()
                 action = agent.get_action(state)
-                state_, reward, done, info = env.step(action)
+                state_, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
                 agent.store_transition(state, action, reward)
                 state = state_
                 episode_reward += reward
 
-                # update ppo
                 if len(agent.state_buffer) >= BATCH_SIZE:
                     agent.finish_path(state_, done)
                     agent.update()
@@ -305,18 +236,19 @@ if __name__ == '__main__':
         plt.savefig(os.path.join('image', '_'.join([ALG_NAME, ENV_ID])))
 
     if args.test:
-        # test
         agent.load()
         for episode in range(TEST_EPISODES):
-            state = env.reset()
+            state, info = env.reset()
             episode_reward = 0
             for step in range(MAX_STEPS):
-                env.render()
-                state, reward, done, info = env.step(agent.get_action(state, greedy=True))
+                if RENDER:
+                    env.render()
+                state_, reward, terminated, truncated, info = env.step(agent.get_action(state, greedy=True))
+                done = terminated or truncated
+                state = state_
                 episode_reward += reward
                 if done:
                     break
             print(
                 'Testing  | Episode: {}/{}  | Episode Reward: {:.4f}  | Running Time: {:.4f}'.format(
-                    episode + 1, TEST_EPISODES, episode_reward,
-                    time.time() - t0))
+                    episode + 1, TEST_EPISODES, episode_reward, time.time() - t0))

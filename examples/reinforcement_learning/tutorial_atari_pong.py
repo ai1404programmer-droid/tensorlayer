@@ -1,147 +1,140 @@
 #! /usr/bin/python
 # -*- coding: utf-8 -*-
-"""Monte-Carlo Policy Network π(a|s)  (REINFORCE).
-To understand Reinforcement Learning, we let computer to learn how to play
-Pong game from the original screen inputs. Before we start, we highly recommend
-you to go through a famous blog called “Deep Reinforcement Learning: Pong from
-Pixels” which is a minimalistic implementation of deep reinforcement learning by
-using python-numpy and OpenAI gym environment.
-The code here is the reimplementation of Karpathy's Blog by using TensorLayer.
-Compare with Karpathy's code, we store observation for a batch, but he store
-observation for only one episode and gradients. (so we will use
-more memory if the observation is very large.)
-
-TODO
------
-- update grads every step rather than storing all observation!
-- tensorlayer@gmail.com
-
-References
-------------
-- http://karpathy.github.io/2016/05/31/rl/
 """
+REINFORCE (Monte-Carlo Policy Network) for Pong-v5
+with Gymnasium + AtariPreprocessing (grayscale)
+"""
+import os
 import time
-
-import gym
 import numpy as np
 import tensorflow as tf
-
 import tensorlayer as tl
+import gymnasium as gym
+from gymnasium.wrappers import AtariPreprocessing
+import ale_py
 
 tl.logging.set_verbosity(tl.logging.DEBUG)
 
-# hyper-parameters
-image_size = 80
-D = image_size * image_size
-H = 200
+# ================= hyperparameters =================
+screen_size = 84
+input_dim = screen_size * screen_size  # grayscale image -> 1 channel
+H = 200                  # hidden layer size
 batch_size = 10
 learning_rate = 1e-4
 gamma = 0.99
 decay_rate = 0.99
-render = False  # display the game environment
-# resume = True         # load existing policy network
-model_file_name = "model_pong"
+render = True
+model_file_name = "model_pong_v5.npz"
+
 np.set_printoptions(threshold=np.inf)
 
+# ================= Atari environment =================
+gym.register_envs(ale_py)
+env = gym.make("ALE/Pong-v5", frameskip=1, render_mode="rgb_array")
+env = AtariPreprocessing(
+    env,
+    noop_max=10,
+    frame_skip=4,
+    terminal_on_life_loss=True,
+    screen_size=screen_size,
+    grayscale_obs=True,     # یک کانال
+    grayscale_newaxis=False # shape -> (84,84)
+)
 
-def prepro(I):
-    """Prepro 210x160x3 uint8 frame into 6400 (80x80) 1D float vector."""
-    I = I[35:195]
-    I = I[::2, ::2, 0]
-    I[I == 144] = 0
-    I[I == 109] = 0
-    I[I != 0] = 1
-    return I.astype(np.float32).ravel()
+# ================= preprocess frame =================
+def prepro(frame):
+    """Flatten grayscale frame"""
+    return frame.astype(np.float32).ravel()
 
+# ================= policy network =================
+def get_model(input_dim):
+    ni = tl.layers.Input([None, input_dim], name='input')
+    nn = tl.layers.Dense(H, act=tf.nn.relu, name='hidden')(ni)
+    nn = tl.layers.Dense(3, name='output')(nn)  # 3 actions: stay, up, down
+    return tl.models.Model(inputs=ni, outputs=nn, name='policy_net')
 
-env = gym.make("Pong-v0")
-observation = env.reset()
+model = get_model(input_dim)
+train_weights = model.trainable_weights
+optimizer = tf.optimizers.RMSprop(learning_rate=learning_rate, rho=decay_rate)
+model.train()
+
+# ================= save/load =================
+def save_ckpt(model):
+    os.makedirs('model', exist_ok=True)
+    tl.files.save_npz_dict(model.trainable_weights, name=os.path.join('model', model_file_name))
+
+def load_ckpt(model):
+    path = os.path.join('model', model_file_name)
+    if os.path.exists(path):
+        tl.files.load_and_assign_npz_dict(name=path, network=model)
+        print(f"[INFO] Loaded model from {path}")
+
+# ================= training =================
+observation, _ = env.reset()
 prev_x = None
-running_reward = None
 reward_sum = 0
 episode_number = 0
-
+game_number = 0
+running_reward = None
+MAX_EPISODES = 10
 xs, ys, rs = [], [], []
 
-
-# policy network
-def get_model(inputs_shape):
-    ni = tl.layers.Input(inputs_shape)
-    nn = tl.layers.Dense(n_units=H, act=tf.nn.relu, name='hidden')(ni)
-    nn = tl.layers.Dense(n_units=3, name='output')(nn)
-    M = tl.models.Model(inputs=ni, outputs=nn, name="mlp")
-    return M
-
-
-model = get_model([None, D])
-train_weights = model.trainable_weights
-
-optimizer = tf.optimizers.RMSprop(lr=learning_rate, decay=decay_rate)
-
-model.train()  # set model to train mode (in case you add dropout into the model)
-
 start_time = time.time()
-game_number = 0
-while True:
+
+while episode_number < MAX_EPISODES:
     if render:
         env.render()
 
     cur_x = prepro(observation)
-    x = cur_x - prev_x if prev_x is not None else np.zeros(D, dtype=np.float32)
-    x = x.reshape(1, D)
+    x = cur_x - prev_x if prev_x is not None else np.zeros(input_dim, dtype=np.float32)
+    x = x.reshape(1, input_dim)
     prev_x = cur_x
 
-    _prob = model(x)
-    prob = tf.nn.softmax(_prob)
+    logits = model(x)
+    prob = tf.nn.softmax(logits).numpy()[0]
 
-    # action. 1: STOP  2: UP  3: DOWN
-    # action = np.random.choice([1,2,3], p=prob.flatten())
-    # action = tl.rein.choice_action_by_probs(prob.flatten(), [1, 2, 3])
-    action = tl.rein.choice_action_by_probs(prob[0].numpy(), [1, 2, 3])
+    # choose action: 1=stay, 2=up, 3=down
+    action = tl.rein.choice_action_by_probs(prob, [1, 2, 3])
+    observation, reward, terminated, truncated, _ = env.step(action)
+    done = terminated or truncated
 
-    observation, reward, done, _ = env.step(action)
     reward_sum += reward
-    xs.append(x)  # all observations in an episode
-    ys.append(action - 1)  # all fake labels in an episode (action begins from 1, so minus 1)
-    rs.append(reward)  # all rewards in an episode
+    xs.append(x)
+    ys.append(action - 1)  # adjust to 0-index
+    rs.append(reward)
 
     if done:
         episode_number += 1
         game_number = 0
 
         if episode_number % batch_size == 0:
-            print('batch over...... updating parameters......')
+            print('Batch finished. Updating parameters...')
             epx = np.vstack(xs)
             epy = np.asarray(ys)
             epr = np.asarray(rs)
-            disR = tl.rein.discount_episode_rewards(epr, gamma)
-            disR -= np.mean(disR)
-            disR /= np.std(disR)
+
+            discounted_r = tl.rein.discount_episode_rewards(epr, gamma)
+            discounted_r -= np.mean(discounted_r)
+            discounted_r /= np.std(discounted_r) + 1e-8
 
             xs, ys, rs = [], [], []
 
             with tf.GradientTape() as tape:
-                _prob = model(epx)
-                _loss = tl.rein.cross_entropy_reward_loss(_prob, epy, disR)
-            grad = tape.gradient(_loss, train_weights)
-            optimizer.apply_gradients(zip(grad, train_weights))
+                logits = model(epx)
+                loss = tl.rein.cross_entropy_reward_loss(logits, epy, discounted_r)
+            grads = tape.gradient(loss, train_weights)
+            optimizer.apply_gradients(zip(grads, train_weights))
 
-        ## TODO
-        # if episode_number % (batch_size * 100) == 0:
-        #     tl.files.save_npz(network.all_params, name=model_file_name + '.npz')
+            save_ckpt(model)
 
         running_reward = reward_sum if running_reward is None else running_reward * 0.99 + reward_sum * 0.01
-        print('resetting env. episode reward total was {}. running mean: {}'.format(reward_sum, running_reward))
+        print(f'Episode {episode_number} finished. Episode reward: {reward_sum}, Running mean: {running_reward:.2f}')
         reward_sum = 0
-        observation = env.reset()  # reset env
+        observation, _ = env.reset()
         prev_x = None
 
     if reward != 0:
-        print(
-            (
-                'episode %d: game %d took %.5fs, reward: %f' %
-                (episode_number, game_number, time.time() - start_time, reward)
-            ), ('' if reward == -1 else ' !!!!!!!!')
-        )
+        print(f'Episode {episode_number}: game {game_number} reward {reward} time {time.time() - start_time:.2f}s',
+              '' if reward == -1 else '!!!!!!!')
         start_time = time.time()
         game_number += 1
